@@ -19,7 +19,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/delay.h>
-#include <linux/platform_device.h>
+#include <linux/acpi.h>
 #include <linux/input.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
@@ -35,11 +35,23 @@
 #include <linux/err.h>
 
 /* data port used by Apple SMC */
-#define APPLESMC_DATA_PORT	0x300
+#define APPLESMC_DATA_PORT	0
 /* command/status port used by Apple SMC */
-#define APPLESMC_CMD_PORT	0x304
+#define APPLESMC_CMD_PORT	4
 
 #define APPLESMC_NR_PORTS	32 /* 0x300-0x31f */
+
+#define APPLESMC_IOMEM_KEY_DATA		0
+#define APPLESMC_IOMEM_KEY_STATUS	0x4005
+#define APPLESMC_IOMEM_KEY_NAME		0x78
+#define APPLESMC_IOMEM_KEY_DATA_LEN	0x7D
+#define APPLESMC_IOMEM_KEY_SMC_ID	0x7E
+#define APPLESMC_IOMEM_KEY_CMD		0x7F
+#define APPLESMC_IOMEM_MIN_SIZE		0x4006
+
+#define APPLESMC_IOMEM_KEY_TYPE_CODE		0
+#define APPLESMC_IOMEM_KEY_TYPE_DATA_LEN	5
+#define APPLESMC_IOMEM_KEY_TYPE_FLAGS		6
 
 #define APPLESMC_MAX_DATA_LENGTH 32
 
@@ -71,6 +83,7 @@
 #define FAN_ID_FMT		"F%dID" /* r-o char[16] */
 
 #define TEMP_SENSOR_TYPE	"sp78"
+#define FLOAT_TYPE	"flt "
 
 /* List of keys used to read/write fan speeds */
 static const char *const fan_speed_fmt[] = {
@@ -80,6 +93,7 @@ static const char *const fan_speed_fmt[] = {
 	"F%dSf",		/* safe speed - not all models */
 	"F%dTg",		/* target speed (manual: rw) */
 };
+#define FAN_MANUAL_FMT "F%dMd"
 
 #define INIT_TIMEOUT_MSECS	5000	/* wait up to 5s for device init ... */
 #define INIT_WAIT_MSECS		50	/* ... in 50ms increments */
@@ -133,8 +147,14 @@ struct applesmc_registers {
 };
 
 struct applesmc_device {
-	struct platform_device *dev;
+	struct acpi_device *dev;
+	struct device *ldev;
 	struct applesmc_registers reg;
+
+	bool port_base_set, iomem_base_set;
+	u16 port_base;
+	u8 *__iomem iomem_base;
+	u32 iomem_base_addr, iomem_base_size;
 
 	s16 rest_x;
 	s16 rest_y;
@@ -161,7 +181,7 @@ static const int debug;
  * wait_read - Wait for a byte to appear on SMC port. Callers must
  * hold applesmc_lock.
  */
-static int wait_read(void)
+static int port_wait_read(struct applesmc_device *smc)
 {
 	unsigned long end = jiffies + (APPLESMC_MAX_WAIT * HZ) / USEC_PER_SEC;
 	u8 status;
@@ -169,7 +189,7 @@ static int wait_read(void)
 
 	for (us = APPLESMC_MIN_WAIT; us < APPLESMC_MAX_WAIT; us <<= 1) {
 		usleep_range(us, us * 16);
-		status = inb(APPLESMC_CMD_PORT);
+		status = inb(smc->port_base + APPLESMC_CMD_PORT);
 		/* read: wait for smc to settle */
 		if (status & 0x01)
 			return 0;
@@ -186,16 +206,16 @@ static int wait_read(void)
  * send_byte - Write to SMC port, retrying when necessary. Callers
  * must hold applesmc_lock.
  */
-static int send_byte(u8 cmd, u16 port)
+static int port_send_byte(struct applesmc_device *smc, u8 cmd, u16 port)
 {
 	u8 status;
 	int us;
 	unsigned long end = jiffies + (APPLESMC_MAX_WAIT * HZ) / USEC_PER_SEC;
 
-	outb(cmd, port);
+	outb(cmd, smc->port_base + port);
 	for (us = APPLESMC_MIN_WAIT; us < APPLESMC_MAX_WAIT; us <<= 1) {
 		usleep_range(us, us * 16);
-		status = inb(APPLESMC_CMD_PORT);
+		status = inb(smc->port_base + APPLESMC_CMD_PORT);
 		/* write: wait for smc to settle */
 		if (status & 0x02)
 			continue;
@@ -207,59 +227,60 @@ static int send_byte(u8 cmd, u16 port)
 			break;
 		/* busy: long wait and resend */
 		udelay(APPLESMC_RETRY_WAIT);
-		outb(cmd, port);
+		outb(cmd, smc->port_base + port);
 	}
 
 	pr_warn("send_byte(0x%02x, 0x%04x) fail: 0x%02x\n", cmd, port, status);
 	return -EIO;
 }
 
-static int send_command(u8 cmd)
+static int port_send_command(struct applesmc_device *smc, u8 cmd)
 {
-	return send_byte(cmd, APPLESMC_CMD_PORT);
+	return port_send_byte(smc, cmd, APPLESMC_CMD_PORT);
 }
 
-static int send_argument(const char *key)
+static int port_send_argument(struct applesmc_device *smc, const char *key)
 {
 	int i;
 
 	for (i = 0; i < 4; i++)
-		if (send_byte(key[i], APPLESMC_DATA_PORT))
+		if (port_send_byte(smc, key[i], APPLESMC_DATA_PORT))
 			return -EIO;
 	return 0;
 }
 
-static int read_smc(u8 cmd, const char *key, u8 *buffer, u8 len)
+static int port_read_smc(struct applesmc_device *smc, u8 cmd, const char *key,
+	u8 *buffer, u8 len)
 {
 	u8 status, data = 0;
 	int i;
 
-	if (send_command(cmd) || send_argument(key)) {
+	if (port_send_command(smc, cmd) || port_send_argument(smc, key)) {
 		pr_warn("%.4s: read arg fail\n", key);
 		return -EIO;
 	}
 
 	/* This has no effect on newer (2012) SMCs */
-	if (send_byte(len, APPLESMC_DATA_PORT)) {
+	if (port_send_byte(smc, len, APPLESMC_DATA_PORT)) {
 		pr_warn("%.4s: read len fail\n", key);
 		return -EIO;
 	}
 
 	for (i = 0; i < len; i++) {
-		if (wait_read()) {
+		if (port_wait_read(smc)) {
 			pr_warn("%.4s: read data[%d] fail\n", key, i);
 			return -EIO;
 		}
-		buffer[i] = inb(APPLESMC_DATA_PORT);
+		buffer[i] = inb(smc->port_base + APPLESMC_DATA_PORT);
 	}
 
 	/* Read the data port until bit0 is cleared */
 	for (i = 0; i < 16; i++) {
 		udelay(APPLESMC_MIN_WAIT);
-		status = inb(APPLESMC_CMD_PORT);
+		status = inb(smc->port_base + APPLESMC_CMD_PORT);
 		if (!(status & 0x01))
 			break;
-		data = inb(APPLESMC_DATA_PORT);
+		data = inb(smc->port_base + APPLESMC_DATA_PORT);
 	}
 	if (i)
 		pr_warn("flushed %d bytes, last value is: %d\n", i, data);
@@ -267,22 +288,23 @@ static int read_smc(u8 cmd, const char *key, u8 *buffer, u8 len)
 	return 0;
 }
 
-static int write_smc(u8 cmd, const char *key, const u8 *buffer, u8 len)
+static int port_write_smc(struct applesmc_device *smc, u8 cmd, const char *key,
+	const u8 *buffer, u8 len)
 {
 	int i;
 
-	if (send_command(cmd) || send_argument(key)) {
+	if (port_send_command(smc, cmd) || port_send_argument(smc, key)) {
 		pr_warn("%s: write arg fail\n", key);
 		return -EIO;
 	}
 
-	if (send_byte(len, APPLESMC_DATA_PORT)) {
+	if (port_send_byte(smc, len, APPLESMC_DATA_PORT)) {
 		pr_warn("%.4s: write len fail\n", key);
 		return -EIO;
 	}
 
 	for (i = 0; i < len; i++) {
-		if (send_byte(buffer[i], APPLESMC_DATA_PORT)) {
+		if (port_send_byte(smc, buffer[i], APPLESMC_DATA_PORT)) {
 			pr_warn("%s: write data fail\n", key);
 			return -EIO;
 		}
@@ -291,13 +313,190 @@ static int write_smc(u8 cmd, const char *key, const u8 *buffer, u8 len)
 	return 0;
 }
 
-static int read_register_count(unsigned int *count)
+static int port_get_smc_key_info(struct applesmc_device *smc,
+	const char *key, struct applesmc_entry *info)
+{
+	int ret;
+	u8 raw[6];
+
+	ret = port_read_smc(smc, APPLESMC_GET_KEY_TYPE_CMD, key, raw, 6);
+	if (ret)
+		return ret;
+	info->len = raw[0];
+	memcpy(info->type, &raw[1], 4);
+	info->flags = raw[5];
+	return 0;
+}
+
+
+/*
+ * MMIO based communication.
+ */
+
+static void iomem_clear_status(struct applesmc_device *smc)
+{
+	if (ioread8(smc->iomem_base + APPLESMC_IOMEM_KEY_STATUS)) {
+		iowrite8(0, smc->iomem_base + APPLESMC_IOMEM_KEY_STATUS);
+	}
+}
+
+static int iomem_wait_read(struct applesmc_device *smc)
+{
+	u8 status;
+	int us;
+	for (us = APPLESMC_MIN_WAIT; us < APPLESMC_MAX_WAIT; us <<= 1) {
+		udelay(us);
+		status = ioread8(smc->iomem_base + APPLESMC_IOMEM_KEY_STATUS);
+		if (status & 0x20)
+			return 0;
+		udelay(APPLESMC_RETRY_WAIT);
+	}
+	dev_warn(smc->ldev, "iomem_wait_read() timeout\n");
+	return -EIO;
+}
+
+static int iomem_read_smc(struct applesmc_device *smc, u8 cmd, const char *key,
+	u8 *buffer, u8 len)
+{
+	u8 err, remote_len;
+	u32 key_int = *((u32 *) key);
+	iomem_clear_status(smc);
+	iowrite32(key_int, smc->iomem_base + APPLESMC_IOMEM_KEY_NAME);
+	iowrite32(0, smc->iomem_base + APPLESMC_IOMEM_KEY_SMC_ID);
+	iowrite32(cmd, smc->iomem_base + APPLESMC_IOMEM_KEY_CMD);
+	if (iomem_wait_read(smc)) {
+		return -EIO;
+	}
+	err = ioread8(smc->iomem_base + APPLESMC_IOMEM_KEY_CMD);
+	if (err != 0) {
+		dev_warn(smc->ldev, "read_smc_mmio(%x %8x/%.4s) failed: %u\n",
+				cmd, key_int, key, err);
+		return -EIO;
+	}
+	if (cmd == APPLESMC_READ_CMD) {
+		remote_len = ioread8(smc->iomem_base + APPLESMC_IOMEM_KEY_DATA_LEN);
+		if (remote_len != len) {
+			dev_warn(smc->ldev, "read_smc_mmio(%x %8x/%.4s) failed: "
+					"buffer length mismatch (remote = %u, requested = %u)\n",
+					 cmd, key_int, key, remote_len, len);
+			return -EINVAL;
+		}
+	} else {
+		remote_len = len;
+	}
+	memcpy_fromio(buffer, smc->iomem_base + APPLESMC_IOMEM_KEY_DATA,
+			remote_len);
+	dev_dbg(smc->ldev, "read_smc_mmio(%x %8x/%.4s): buflen=%u reslen=%u\n",
+			cmd, key_int, key, len, remote_len);
+	print_hex_dump_bytes("read_smc_mmio(): ", DUMP_PREFIX_NONE, buffer, remote_len);
+	return 0;
+}
+
+static int iomem_get_smc_key_type(struct applesmc_device *smc, const char *key,
+	struct applesmc_entry *e)
+{
+	u8 err;
+	u8 cmd = APPLESMC_GET_KEY_TYPE_CMD;
+	u32 key_int = *((u32 *) key);
+	iomem_clear_status(smc);
+	iowrite32(key_int, smc->iomem_base + APPLESMC_IOMEM_KEY_NAME);
+	iowrite32(0, smc->iomem_base + APPLESMC_IOMEM_KEY_SMC_ID);
+	iowrite32(cmd, smc->iomem_base + APPLESMC_IOMEM_KEY_CMD);
+	if (iomem_wait_read(smc)) {
+		return -EIO;
+	}
+	err = ioread8(smc->iomem_base + APPLESMC_IOMEM_KEY_CMD);
+	if (err != 0) {
+		dev_warn(smc->ldev, "get_smc_key_type_mmio(%.4s) failed: %u\n", key, err);
+		return -EIO;
+	}
+	e->len = ioread8(smc->iomem_base + APPLESMC_IOMEM_KEY_TYPE_DATA_LEN);
+	*((uint32_t *) e->type) = ioread32(
+			smc->iomem_base + APPLESMC_IOMEM_KEY_TYPE_CODE);
+	e->flags = ioread8(smc->iomem_base + APPLESMC_IOMEM_KEY_TYPE_FLAGS);
+	dev_dbg(smc->ldev, "get_smc_key_type_mmio(%.4s): "
+			"len=%u type=%.4s flags=%x\n", key, e->len, e->type, e->flags);
+	return 0;
+}
+
+static int iomem_write_smc(struct applesmc_device *smc, u8 cmd, const char *key, const u8 *buffer, u8 len)
+{
+	u8 err;
+	u32 key_int = *((u32 *) key);
+	iomem_clear_status(smc);
+	iowrite32(key_int, smc->iomem_base + APPLESMC_IOMEM_KEY_NAME);
+	memcpy_toio(smc->iomem_base + APPLESMC_IOMEM_KEY_DATA, buffer, len);
+	iowrite32(len, smc->iomem_base + APPLESMC_IOMEM_KEY_DATA_LEN);
+	iowrite32(0, smc->iomem_base + APPLESMC_IOMEM_KEY_SMC_ID);
+	iowrite32(cmd , smc->iomem_base + APPLESMC_IOMEM_KEY_CMD);
+	if (iomem_wait_read(smc)) {
+		return -EIO;
+	}
+	err = ioread8(smc->iomem_base + APPLESMC_IOMEM_KEY_CMD);
+	if (err != 0) {
+		dev_warn(smc->ldev, "write_smc_mmio(%x %.4s) failed: %u\n", cmd, key, err);
+		print_hex_dump_bytes("write_smc_mmio(): ", DUMP_PREFIX_NONE, buffer, len);
+		return -EIO;
+	}
+	dev_dbg(smc->ldev, "write_smc_mmio(%x %.4s): buflen=%u\n",
+			cmd, key, len);
+	print_hex_dump_bytes("write_smc_mmio(): ", DUMP_PREFIX_NONE, buffer, len);
+	return 0;
+}
+
+
+static int read_smc(struct applesmc_device *smc, const char *key,
+	u8 *buffer, u8 len)
+{
+	if (smc->iomem_base_set) {
+		return iomem_read_smc(smc, APPLESMC_READ_CMD, key, buffer, len);
+	} else {
+		return port_read_smc(smc, APPLESMC_READ_CMD, key, buffer, len);
+	}
+}
+
+static int write_smc(struct applesmc_device *smc, const char *key,
+	const u8 *buffer, u8 len)
+{
+	if (smc->iomem_base_set) {
+		return iomem_write_smc(smc, APPLESMC_WRITE_CMD, key, buffer, len);
+	} else {
+		return port_write_smc(smc, APPLESMC_WRITE_CMD, key, buffer, len);
+	}
+}
+
+static int get_smc_key_by_index(struct applesmc_device *smc,
+	unsigned int index, char *key)
+{
+	__be32 be;
+	be = cpu_to_be32(index);
+	if (smc->iomem_base_set) {
+		return iomem_read_smc(smc, APPLESMC_GET_KEY_BY_INDEX_CMD,
+							  (const char *) &be, (u8 *) key, 4);
+	} else {
+		return port_read_smc(smc, APPLESMC_GET_KEY_BY_INDEX_CMD,
+							 (const char *) &be, (u8 *) key, 4);
+	}
+}
+
+static int get_smc_key_info(struct applesmc_device *smc, const char *key,
+	struct applesmc_entry *info)
+{
+	if (smc->iomem_base_set) {
+		return iomem_get_smc_key_type(smc, key, info);
+	} else {
+		return port_get_smc_key_info(smc, key, info);
+	}
+}
+
+static int read_register_count(struct applesmc_device *smc,
+	unsigned int *count)
 {
 	__be32 be;
 	int ret;
 
-	ret = read_smc(APPLESMC_READ_CMD, KEY_COUNT_KEY, (u8 *)&be, 4);
-	if (ret)
+	ret = read_smc(smc, KEY_COUNT_KEY, (u8 *)&be, 4);
+	if (ret < 0)
 		return ret;
 
 	*count = be32_to_cpu(be);
@@ -319,7 +518,7 @@ static int applesmc_read_entry(struct applesmc_device *smc,
 	if (entry->len != len)
 		return -EINVAL;
 	mutex_lock(&smc->reg.mutex);
-	ret = read_smc(APPLESMC_READ_CMD, entry->key, buf, len);
+	ret = read_smc(smc, entry->key, buf, len);
 	mutex_unlock(&smc->reg.mutex);
 
 	return ret;
@@ -333,7 +532,7 @@ static int applesmc_write_entry(struct applesmc_device *smc,
 	if (entry->len != len)
 		return -EINVAL;
 	mutex_lock(&smc->reg.mutex);
-	ret = write_smc(APPLESMC_WRITE_CMD, entry->key, buf, len);
+	ret = write_smc(smc, entry->key, buf, len);
 	mutex_unlock(&smc->reg.mutex);
 	return ret;
 }
@@ -342,8 +541,7 @@ static const struct applesmc_entry *applesmc_get_entry_by_index(
 	struct applesmc_device *smc, int index)
 {
 	struct applesmc_entry *cache = &smc->reg.cache[index];
-	u8 key[4], info[6];
-	__be32 be;
+	char key[4];
 	int ret = 0;
 
 	if (cache->valid)
@@ -353,18 +551,14 @@ static const struct applesmc_entry *applesmc_get_entry_by_index(
 
 	if (cache->valid)
 		goto out;
-	be = cpu_to_be32(index);
-	ret = read_smc(APPLESMC_GET_KEY_BY_INDEX_CMD, (u8 *)&be, key, 4);
+	ret = get_smc_key_by_index(smc, index, key);
 	if (ret)
 		goto out;
-	ret = read_smc(APPLESMC_GET_KEY_TYPE_CMD, key, info, 6);
-	if (ret)
-		goto out;
-
 	memcpy(cache->key, key, 4);
-	cache->len = info[0];
-	memcpy(cache->type, &info[1], 4);
-	cache->flags = info[5];
+
+	ret = get_smc_key_info(smc, key, cache);
+	if (ret)
+		goto out;
 	cache->valid = 1;
 
 out:
@@ -492,6 +686,37 @@ static int applesmc_read_s16(struct applesmc_device *smc,
 	return 0;
 }
 
+/**
+ * applesmc_float_to_u32 - Retrieve the integral part of a float.
+ * This is needed because Apple made fans use float values in the T2.
+ * The fractional point is not significantly useful though, and the integral
+ * part can be easily extracted.
+ */
+static inline u32 applesmc_float_to_u32(u32 d)
+{
+	u8 sign = (u8) ((d >> 31) & 1);
+	s32 exp = (s32) ((d >> 23) & 0xff) - 0x7f;
+	u32 fr = d & ((1u << 23) - 1);
+	if (sign || exp < 0)
+		return 0;
+	return (u32) ((1u << exp) + (fr >> (23 - exp)));
+}
+
+/**
+ * applesmc_u32_to_float - Convert an u32 into a float.
+ * See applesmc_float_to_u32 for a rationale.
+ */
+static inline u32 applesmc_u32_to_float(u32 d)
+{
+	u32 dc = d, bc = 0, exp;
+	if (!d)
+		return 0;
+	while (dc >>= 1)
+		++bc;
+	exp = 0x7f + bc;
+	return (u32) ((exp << 23) |
+		((d << (23 - (exp - 0x7f))) & ((1u << 23) - 1)));
+}
 /*
  * applesmc_device_init - initialize the accelerometer.  Can sleep.
  */
@@ -555,7 +780,7 @@ static int applesmc_init_smcreg_try(struct applesmc_device *smc)
 	if (s->init_complete)
 		return 0;
 
-	ret = read_register_count(&count);
+	ret = read_register_count(smc, &count);
 	if (ret)
 		return ret;
 
@@ -651,9 +876,13 @@ static int applesmc_init_smcreg(struct applesmc_device *smc)
 }
 
 /* Device model stuff */
+
+static int applesmc_init_resources(struct applesmc_device *smc);
+static void applesmc_free_resources(struct applesmc_device *smc);
 static int applesmc_create_modules(struct applesmc_device *smc);
 static void applesmc_destroy_modules(struct applesmc_device *smc);
-static int applesmc_probe(struct platform_device *dev)
+
+static int applesmc_add(struct acpi_device *dev)
 {
 	struct applesmc_device *smc;
 	int ret;
@@ -662,13 +891,18 @@ static int applesmc_probe(struct platform_device *dev)
 	if (!smc)
 		return -ENOMEM;
 	smc->dev = dev;
+	smc->ldev = &dev->dev;
 	mutex_init(&smc->reg.mutex);
 
-	platform_set_drvdata(dev, smc);
+	dev_set_drvdata(&dev->dev, smc);
+
+	ret = applesmc_init_resources(smc);
+	if (ret)
+		goto out_mem;
 
 	ret = applesmc_init_smcreg(smc);
 	if (ret)
-		goto out_mem;
+		goto out_res;
 
 	applesmc_device_init(smc);
 
@@ -680,25 +914,133 @@ static int applesmc_probe(struct platform_device *dev)
 
 out_reg:
 	applesmc_destroy_smcreg(smc);
+out_res:
+	applesmc_free_resources(smc);
 out_mem:
-	platform_set_drvdata(dev, NULL);
+	dev_set_drvdata(&dev->dev, NULL);
 	mutex_destroy(&smc->reg.mutex);
 	kfree(smc);
 
 	return ret;
 }
 
-static int applesmc_remove(struct platform_device *dev)
+static int applesmc_remove(struct acpi_device *dev)
 {
-	struct applesmc_device *smc = platform_get_drvdata(dev);
+	struct applesmc_device *smc = dev_get_drvdata(&dev->dev);
 
 	applesmc_destroy_modules(smc);
 	applesmc_destroy_smcreg(smc);
+	applesmc_free_resources(smc);
 
 	mutex_destroy(&smc->reg.mutex);
 	kfree(smc);
 
 	return 0;
+}
+
+static acpi_status applesmc_walk_resources(struct acpi_resource *res,
+	void *data)
+{
+	struct applesmc_device *smc = data;
+
+	switch (res->type) {
+		case ACPI_RESOURCE_TYPE_IO:
+			if (!smc->port_base_set) {
+				if (res->data.io.address_length < APPLESMC_NR_PORTS)
+					return AE_ERROR;
+				smc->port_base = res->data.io.minimum;
+				smc->port_base_set = true;
+			}
+			return AE_OK;
+
+		case ACPI_RESOURCE_TYPE_FIXED_MEMORY32:
+			if (!smc->iomem_base_set) {
+				if (res->data.fixed_memory32.address_length <
+						APPLESMC_IOMEM_MIN_SIZE) {
+					dev_warn(smc->ldev, "found iomem but it's too small: %u\n",
+							 res->data.fixed_memory32.address_length);
+					return AE_OK;
+				}
+				smc->iomem_base_addr = res->data.fixed_memory32.address;
+				smc->iomem_base_size = res->data.fixed_memory32.address_length;
+				smc->iomem_base_set = true;
+			}
+			return AE_OK;
+
+		case ACPI_RESOURCE_TYPE_END_TAG:
+			if (smc->port_base_set)
+				return AE_OK;
+			else
+				return AE_NOT_FOUND;
+
+		default:
+			return AE_OK;
+	}
+}
+
+static int applesmc_try_enable_iomem(struct applesmc_device *smc);
+
+static int applesmc_init_resources(struct applesmc_device *smc)
+{
+	int ret;
+
+	ret = acpi_walk_resources(smc->dev->handle, METHOD_NAME__CRS,
+			applesmc_walk_resources, smc);
+	if (ACPI_FAILURE(ret))
+		return -ENXIO;
+
+	if (!request_region(smc->port_base, APPLESMC_NR_PORTS, "applesmc"))
+		return -ENXIO;
+
+	if (smc->iomem_base_set) {
+		if (applesmc_try_enable_iomem(smc))
+			smc->iomem_base_set = false;
+	}
+
+	return 0;
+}
+
+static int applesmc_try_enable_iomem(struct applesmc_device *smc)
+{
+	u8 test_val, ldkn_version;
+
+	dev_dbg(smc->ldev, "Trying to enable iomem based communication\n");
+	smc->iomem_base = ioremap(smc->iomem_base_addr, smc->iomem_base_size);
+	if (!smc->iomem_base)
+		goto out;
+
+	/* Apple's driver does this check for some reason */
+	test_val = ioread8(smc->iomem_base + APPLESMC_IOMEM_KEY_STATUS);
+	if (test_val == 0xff) {
+		dev_warn(smc->ldev, "iomem enable failed: "
+				"initial status is 0xff (is %x)\n", test_val);
+		goto out_iomem;
+	}
+
+	if (read_smc(smc, "LDKN", &ldkn_version, 1)) {
+		dev_warn(smc->ldev, "iomem enable failed: ldkn read failed\n");
+		goto out_iomem;
+	}
+
+	if (ldkn_version < 2) {
+		dev_warn(smc->ldev, "iomem enable failed: "
+				"ldkn version %u is less than minimum (2)\n", ldkn_version);
+		goto out_iomem;
+	}
+
+	return 0;
+
+out_iomem:
+	iounmap(smc->iomem_base);
+out:
+	return -ENXIO;
+}
+
+static void applesmc_free_resources(struct applesmc_device *smc)
+{
+	if (smc->iomem_base_set)
+		iounmap(smc->iomem_base);
+	release_region(smc->port_base, APPLESMC_NR_PORTS);
 }
 
 /* Synchronize device with memorized backlight state */
@@ -722,18 +1064,28 @@ static int applesmc_pm_restore(struct device *dev)
 	return applesmc_pm_resume(dev);
 }
 
+static const struct acpi_device_id applesmc_ids[] = {
+	{"APP0001", 0},
+	{"", 0},
+};
+
 static const struct dev_pm_ops applesmc_pm_ops = {
 	.resume = applesmc_pm_resume,
 	.restore = applesmc_pm_restore,
 };
 
-static struct platform_driver applesmc_driver = {
-	.probe = applesmc_probe,
-	.remove = applesmc_remove,
-	.driver	= {
-		.name = "applesmc",
-		.pm = &applesmc_pm_ops,
+static struct acpi_driver applesmc_driver = {
+	.name = "applesmc",
+	.class = "applesmc",
+	.ids = applesmc_ids,
+	.ops = {
+		.add = applesmc_add,
+		.remove = applesmc_remove
 	},
+	.drv = {
+		.pm = &applesmc_pm_ops
+	},
+	.owner = THIS_MODULE
 };
 
 /*
@@ -867,6 +1219,7 @@ static ssize_t applesmc_show_fan_speed(struct device *dev,
 				struct device_attribute *attr, char *sysfsbuf)
 {
 	struct applesmc_device *smc = dev_get_drvdata(dev);
+	const struct applesmc_entry *ent;
 	int ret;
 	unsigned int speed = 0;
 	char newkey[5];
@@ -889,6 +1242,7 @@ static ssize_t applesmc_store_fan_speed(struct device *dev,
 					const char *sysfsbuf, size_t count)
 {
 	struct applesmc_device *smc = dev_get_drvdata(dev);
+	const struct applesmc_entry *ent;
 	int ret;
 	unsigned long speed;
 	char newkey[5];
@@ -900,9 +1254,19 @@ static ssize_t applesmc_store_fan_speed(struct device *dev,
 	scnprintf(newkey, sizeof(newkey), fan_speed_fmt[to_option(attr)],
 		  to_index(attr));
 
-	buffer[0] = (speed >> 6) & 0xff;
-	buffer[1] = (speed << 2) & 0xff;
-	ret = applesmc_write_key(smc, newkey, buffer, 2);
+	ent = applesmc_get_entry_by_key(smc, newkey);
+	if (IS_ERR(ent)) {
+		return PTR_ERR(ent);
+	}
+
+	if (!strcmp(ent->type, FLOAT_TYPE)) {
+		speed = applesmc_u32_to_float(speed);
+		ret = applesmc_write_entry(smc, ent, (u8 *) &speed, 4);
+	} else {
+		buffer[0] = (speed >> 6) & 0xff;
+		buffer[1] = (speed << 2) & 0xff;
+		ret = applesmc_write_key(smc, newkey, buffer, 2);
+	}
 
 	if (ret)
 		return ret;
@@ -934,27 +1298,33 @@ static ssize_t applesmc_store_fan_manual(struct device *dev,
 	struct applesmc_device *smc = dev_get_drvdata(dev);
 	int ret;
 	u8 buffer[2];
+	char newkey[5];
+	bool has_newkey = false;
 	unsigned long input;
 	u16 val;
 
 	if (kstrtoul(sysfsbuf, 10, &input) < 0)
 		return -EINVAL;
 
-	ret = applesmc_read_key(smc, FANS_MANUAL, buffer, 2);
-	val = (buffer[0] << 8 | buffer[1]);
-	if (ret)
-		goto out;
+	scnprintf(newkey, sizeof(newkey), FAN_MANUAL_FMT, to_index(attr));
+	ret = applesmc_has_key(smc, newkey, &has_newkey);
 
-	if (input)
-		val = val | (0x01 << to_index(attr));
-	else
-		val = val & ~(0x01 << to_index(attr));
-
-	buffer[0] = (val >> 8) & 0xFF;
-	buffer[1] = val & 0xFF;
-
-	ret = applesmc_write_key(smc, FANS_MANUAL, buffer, 2);
-
+ 	if (has_newkey) {
+                buffer[0] = input & 1;
+                ret = applesmc_write_key(smc, newkey, buffer, 1);
+        } else {
+                ret = applesmc_read_key(smc, FANS_MANUAL, buffer, 2);
+                val = (buffer[0] << 8 | buffer[1]);
+                if (ret)
+                       goto out;
+                if (input)
+                        val = val | (0x01 << to_index(attr));
+                else
+                        val = val & ~(0x01 << to_index(attr));
+		buffer[0] = (val >> 8) & 0xFF;
+		buffer[1] = val & 0xFF;
+		ret = applesmc_write_key(smc, FANS_MANUAL, buffer, 2);
+	}
 out:
 	if (ret)
 		return ret;
@@ -1219,7 +1589,6 @@ out:
 static int applesmc_create_accelerometer(struct applesmc_device *smc)
 {
 	int ret;
-
 	if (!smc->reg.has_accelerometer)
 		return 0;
 
@@ -1420,8 +1789,6 @@ static void applesmc_destroy_modules(struct applesmc_device *smc)
 	applesmc_destroy_nodes(smc, info_group);
 }
 
-static struct platform_device *pdev;
-
 static int __init applesmc_init(void)
 {
 	int ret;
@@ -1432,29 +1799,12 @@ static int __init applesmc_init(void)
 		goto out;
 	}
 
-	if (!request_region(APPLESMC_DATA_PORT, APPLESMC_NR_PORTS,
-								"applesmc")) {
-		ret = -ENXIO;
-		goto out;
-	}
-
-	ret = platform_driver_register(&applesmc_driver);
+	ret = acpi_bus_register_driver(&applesmc_driver);
 	if (ret)
-		goto out_region;
-
-	pdev = platform_device_register_simple("applesmc", APPLESMC_DATA_PORT,
-					       NULL, 0);
-	if (IS_ERR(pdev)) {
-		ret = PTR_ERR(pdev);
-		goto out_driver;
-	}
+		goto out;
 
 	return 0;
 
-out_driver:
-	platform_driver_unregister(&applesmc_driver);
-out_region:
-	release_region(APPLESMC_DATA_PORT, APPLESMC_NR_PORTS);
 out:
 	pr_warn("driver init failed (ret=%d)!\n", ret);
 	return ret;
@@ -1462,9 +1812,7 @@ out:
 
 static void __exit applesmc_exit(void)
 {
-	platform_device_unregister(pdev);
-	platform_driver_unregister(&applesmc_driver);
-	release_region(APPLESMC_DATA_PORT, APPLESMC_NR_PORTS);
+	acpi_bus_unregister_driver(&applesmc_driver);
 }
 
 module_init(applesmc_init);
