@@ -1392,11 +1392,12 @@ static void applesmc_brightness_set(struct led_classdev *led_cdev,
 static ssize_t applesmc_key_count_show(struct device *dev,
 				struct device_attribute *attr, char *sysfsbuf)
 {
+	struct applesmc_device *smc = dev_get_drvdata(dev);
 	int ret;
 	u8 buffer[4];
 	u32 count;
 
-	ret = applesmc_read_key(KEY_COUNT_KEY, buffer, 4);
+	ret = applesmc_read_key(smc, KEY_COUNT_KEY, buffer, 4);
 	count = ((u32)buffer[0]<<24) + ((u32)buffer[1]<<16) +
 						((u32)buffer[2]<<8) + buffer[3];
 
